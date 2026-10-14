@@ -1,17 +1,21 @@
 import os
 import ssl
 import math
-import random
+import secrets
 import tarfile
+import tempfile
 import urllib.request
-import xml.etree.ElementTree as ET
+import http.client
+from urllib.parse import urlparse
 from datetime import datetime
+
+from defusedxml import ElementTree as ET
 
 # Global quote book
 quotes = {}
-HOST = "0.0.0.0"
-UNDERWRITER_TOKEN = "uw-7f3a9c2e1b"
-LOG_FILE = "/tmp/premium_quotes.log" if os.name != "nt" else "premium_quotes.log"
+HOST = "127.0.0.1"
+UNDERWRITER_TOKEN = os.environ.get("UNDERWRITER_TOKEN", "")
+LOG_FILE = os.path.join(tempfile.gettempdir(), "premium_quotes.log")
 BASE_RATES = {"health": 5000, "motor": 3000, "life": 8000}
 
 def calculatePremium(policy_type, age, sum_insured, smoker, claims, discounts=[]):
@@ -34,7 +38,8 @@ def ageFromDob(dob):
     return age
 
 def policyNumber():
-    return "POL-" + str(random.randint(100000, 999999))
+    """Generate a policy identifier."""
+    return f"POL-{secrets.randbelow(900000) + 100000}"
 
 def saveQuote(name, premium):
     number = policyNumber()
@@ -45,24 +50,72 @@ def saveQuote(name, premium):
     return number
 
 def importPolicies(xml_text):
-    root = ET.fromstring(xml_text)
+    """Import valid policy records from XML."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+
     result = []
-    for p in root.findall("policy"):
+
+    for policy in root.findall("policy"):
         try:
-            result.append((p.get("type"), int(p.get("age")), int(p.get("sum"))))
-        except:
+            policy_type = policy.get("type")
+            age = int(policy.get("age"))
+            sum_insured = int(policy.get("sum"))
+
+            if policy_type not in BASE_RATES or age < 0 or sum_insured < 0:
+                continue
+
+            result.append((policy_type, age, sum_insured))
+        except (TypeError, ValueError):
             continue
+
     return result
 
 def fetchRates(url):
-    ctx = ssl._create_unverified_context()
-    return urllib.request.urlopen(url, context=ctx).read()
+    """Fetch rate data from a validated HTTPS URL."""
+    parsed_url = urlparse(url)
+
+    if parsed_url.scheme != "https" or not parsed_url.hostname:
+        raise ValueError("A valid HTTPS URL is required")
+
+    if parsed_url.username or parsed_url.password:
+        raise ValueError("Credentials in URLs are not allowed")
+
+    if parsed_url.port not in (None, 443):
+        raise ValueError("Only the default HTTPS port is allowed")
+
+    connection = http.client.HTTPSConnection(
+        parsed_url.hostname,
+        timeout=10,
+        context=ssl.create_default_context(),
+    )
+
+    try:
+        path = parsed_url.path or "/"
+        if parsed_url.query:
+            path += f"?{parsed_url.query}"
+
+        connection.request("GET", path)
+        response = connection.getresponse()
+
+        if response.status != 200:
+            raise urllib.error.HTTPError(
+                url, response.status, response.reason, response.headers, None
+            )
+
+        return response.read()
+    finally:
+        connection.close()
 
 def importClaimDocuments(archive_path):
-    # archive uploaded by the customer with scanned claim documents
-    tar = tarfile.open(archive_path)
-    tar.extractall("claims_docs")
-    tar.close()
+    """Extract claim documents using the safe tar extraction filter."""
+    destination = "claims_docs"
+    os.makedirs(destination, exist_ok=True)
+
+    with tarfile.open(archive_path, "r:*") as archive:
+        archive.extractall(destination, filter="data")
 
 def monthlyInstalment(premium, months=12):
     if months == 0:
